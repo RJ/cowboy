@@ -51,7 +51,8 @@
 	buffer = <<>> :: binary(),
 	hibernate = false :: boolean(),
 	loop_timeout = infinity :: timeout(),
-	loop_timeout_ref :: undefined | reference()
+	loop_timeout_ref :: undefined | reference(),
+    proxy_peer :: undefined | {inet:ip_address(), inet:ip_port()}
 }).
 
 %% API.
@@ -72,9 +73,48 @@ init(ListenerPid, Socket, Transport, Opts) ->
 	MaxLineLength = proplists:get_value(max_line_length, Opts, 4096),
 	Timeout = proplists:get_value(timeout, Opts, 5000),
 	receive shoot -> ok end,
-	wait_request(#state{listener=ListenerPid, socket=Socket, transport=Transport,
-		dispatch=Dispatch, max_empty_lines=MaxEmptyLines,
-		max_line_length=MaxLineLength, timeout=Timeout}).
+	State = #state{ listener=ListenerPid, socket=Socket, transport=Transport,
+		            dispatch=Dispatch, max_empty_lines=MaxEmptyLines,
+		            max_line_length=MaxLineLength, timeout=Timeout},
+    case proplists:get_value(proxy_protocol, Opts, false) of
+        true  -> wait_proxy_line(State);
+        false -> wait_request(State)
+    end.
+
+%% Parses the first line "PROXY..." on socket containing client IP/port, as per
+%% http://haproxy.1wt.eu/download/1.5/doc/proxy-protocol.txt
+%% This is useful when cowboy is behind stunnel or haproxy etc
+-spec parse_proxy_line(#state{}) -> ok | none().
+parse_proxy_line(State=#state{buffer=Buffer}) ->
+    case binary:split(Buffer, <<"\r\n">>) of
+        [Buffer] when byte_size(Buffer) >= 1024 -> %% TODO max size or proxy line, much less than 1k ?
+            error_terminate(413, State);
+        [Buffer] -> %% No complete line received yet
+            wait_proxy_line(State);
+        [ProxyLine, Remaining] ->
+            io:format("PROXYLINE: ~p\n", [ProxyLine]),
+            case binary:split(ProxyLine, <<" ">>, [global]) of
+                [<<"PROXY">>, _Proto, SAddrBin, _DAddr, SPortBin, _DPort] ->
+                    {SPort, _}  = string:to_integer(binary_to_list(SPortBin)),
+                    {ok, SAddr} = inet_parse:address(binary_to_list(SAddrBin)),
+                    ProxyPeer = {SAddr, SPort}, 
+                    io:format("Proxy parsed, ~w",[ProxyPeer]),
+                    NewState = State#state{buffer=Remaining, 
+                                           proxy_peer=ProxyPeer},
+                    parse_request(NewState);
+                _ ->
+                    error_terminate(413, State)
+            end
+    end.
+
+-spec wait_proxy_line(#state{}) -> ok | none().
+wait_proxy_line(State=#state{socket=Socket, transport=Transport,
+            timeout=T, buffer=Buffer}) ->
+	case Transport:recv(Socket, 0, T) of
+		{ok, Data} -> parse_proxy_line(State#state{
+			buffer= << Buffer/binary, Data/binary >>});
+		{error, _Reason} -> terminate(State)
+	end.
 
 %% @private
 -spec parse_request(#state{}) -> ok | none().
@@ -88,6 +128,7 @@ parse_request(State=#state{buffer=Buffer, max_line_length=MaxLength}) ->
 		{more, _Length} -> wait_request(State);
 		{error, _Reason} -> error_terminate(400, State)
 	end.
+
 
 -spec wait_request(#state{}) -> ok | none().
 wait_request(State=#state{socket=Socket, transport=Transport,
@@ -106,18 +147,18 @@ request({http_request, _Method, _URI, Version}, State)
 	error_terminate(505, State);
 %% @todo We need to cleanup the URI properly.
 request({http_request, Method, {abs_path, AbsPath}, Version},
-		State=#state{socket=Socket, transport=Transport}) ->
+		State=#state{socket=Socket, transport=Transport, proxy_peer=Peer}) ->
 	{Path, RawPath, Qs} = cowboy_dispatcher:split_path(AbsPath),
 	ConnAtom = version_to_connection(Version),
 	parse_header(#http_req{socket=Socket, transport=Transport,
 		connection=ConnAtom, method=Method, version=Version,
-		path=Path, raw_path=RawPath, raw_qs=Qs}, State);
+		path=Path, raw_path=RawPath, raw_qs=Qs, peer=Peer}, State);
 request({http_request, Method, '*', Version},
-		State=#state{socket=Socket, transport=Transport}) ->
+		State=#state{socket=Socket, transport=Transport, proxy_peer=Peer}) ->
 	ConnAtom = version_to_connection(Version),
 	parse_header(#http_req{socket=Socket, transport=Transport,
 		connection=ConnAtom, method=Method, version=Version,
-		path='*', raw_path= <<"*">>, raw_qs= <<>>}, State);
+		path='*', raw_path= <<"*">>, raw_qs= <<>>, peer=Peer}, State);
 request({http_request, _Method, _URI, _Version}, State) ->
 	error_terminate(501, State);
 request({http_error, <<"\r\n">>},

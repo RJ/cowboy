@@ -64,6 +64,7 @@ version(Req) ->
 	{Req#http_req.version, Req}.
 
 %% @doc Return the peer address and port number of the remote host.
+%% TODO this should probably check X-Forwarded-For first?
 -spec peer(#http_req{}) -> {{inet:ip_address(), inet:ip_port()}, #http_req{}}.
 peer(Req=#http_req{socket=Socket, transport=Transport, peer=undefined}) ->
 	{ok, Peer} = Transport:peername(Socket),
