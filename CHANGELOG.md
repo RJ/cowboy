@@ -1,6 +1,12 @@
 CHANGELOG
 =========
 
+x-webkit-deflate-frame branch
+-----------------------------
+
+*	Add x-webkit-deflate-frame compression extension for websockets
+	(prefixed version of unadopted deflate-frame spec, in Chrome 22 etc.)
+
 next
 ----
 

@@ -19,6 +19,9 @@
 %% is no need for concern as crypto is already included.
 -module(cowboy_websocket).
 
+%% Should we use x-webkit-deflate-frame extension?
+-define(ENABLE_X_WEBKIT_DEFLATE_FRAME, true).
+
 %% API.
 -export([upgrade/4]).
 
@@ -36,6 +39,14 @@
 	{nofin, opcode(), binary()} | %% first fragment has been unmasked.
 	{fin, opcode(), binary()}. %% last fragment has been seen.
 
+%% State and settings for (hybi) websockets extensions, like compression
+-record(extinfo, {
+	'x-webkit-deflate-frame' :: any(),
+	z_inf :: any(), %% zlib inflate context
+	z_def :: any(), %% zlib deflate context
+	headers = [] :: [ binary() ] %% headers for Sec-WebSocket-Extensions:
+}).
+
 -record(state, {
 	socket = undefined :: inet:socket(),
 	transport = undefined :: module(),
@@ -49,7 +60,8 @@
 	hibernate = false :: boolean(),
 	eop :: undefined | tuple(), %% hixie-76 specific.
 	origin = undefined :: undefined | binary(), %% hixie-76 specific.
-	frag_state = undefined :: frag_state()
+	frag_state = undefined :: frag_state(),
+	extinfo = #extinfo{} :: #extinfo{} %% used by websocket extensions, like compression
 }).
 
 %% @doc Upgrade a HTTP request to the WebSocket protocol.
@@ -105,9 +117,40 @@ websocket_upgrade(Version, State, Req)
 	{Key, Req2} = cowboy_req:header(<<"sec-websocket-key">>, Req),
 	false = Key =:= undefined,
 	Challenge = hybi_challenge(Key),
+	{Req3, State2} = check_extensions(Version, Req2, State),
 	IntVersion = list_to_integer(binary_to_list(Version)),
-	{ok, State#state{version=IntVersion, challenge=Challenge},
-		cowboy_req:set_meta(websocket_version, IntVersion, Req2)}.
+	{ok, State2#state{version=IntVersion, challenge=Challenge},
+		cowboy_req:set_meta(websocket_version, IntVersion, Req3)}.
+
+
+check_extensions(<<"13">>, Req, State = #state{}) when ?ENABLE_X_WEBKIT_DEFLATE_FRAME ->
+	{H, Req2} = cowboy_req:header(<<"sec-websocket-extensions">>, Req),
+	%% TODO parse this header as per ABNF in the RFC..
+	%%	  for now: this is the only header seen in the wild:
+	case H of
+		<<"x-webkit-deflate-frame">> ->
+			NewState = init_deflate_frame(State),
+			{Req2, NewState};
+		_ ->
+			{Req2, State}
+	end;
+check_extensions(_Ver, Req, State) ->
+	{Req, State}.
+
+init_deflate_frame(State) ->
+	ExtInfo = State#state.extinfo,
+	Header = <<"x-webkit-deflate-frame">>,
+	Zinf = zlib:open(),
+	Zdef = zlib:open(),
+	ok = zlib:inflateInit(Zinf, -15),
+	ok = zlib:deflateInit(Zdef, best_compression, deflated, -15, 9, default),
+	NewExtInfo = ExtInfo#extinfo{
+		'x-webkit-deflate-frame' = true,
+		z_inf = Zinf,
+		z_def = Zdef,
+		headers = [ Header | ExtInfo#extinfo.headers ]
+	},
+	State#state{extinfo = NewExtInfo}.
 
 -spec handler_init(#state{}, cowboy_req:req()) -> closed.
 handler_init(State=#state{transport=Transport, handler=Handler, opts=Opts},
@@ -179,10 +222,12 @@ websocket_handshake(State=#state{socket=Socket, transport=Transport,
 	end;
 websocket_handshake(State=#state{transport=Transport, challenge=Challenge},
 		Req, HandlerState) ->
+	ExtHeaders = hybi_extensions_response_headers(State),
 	{ok, Req2} = cowboy_req:upgrade_reply(
 		101,
 		[{<<"Upgrade">>, <<"websocket">>},
-		 {<<"Sec-Websocket-Accept">>, Challenge}],
+		 {<<"Sec-Websocket-Accept">>, Challenge}
+		 | ExtHeaders ],
 		Req),
 	%% Flush the resp_sent message before moving on.
 	receive {cowboy_req, resp_sent} -> ok after 0 -> ok end,
@@ -262,30 +307,30 @@ websocket_data(State=#state{version=Version}, Req, HandlerState, Data)
 	handler_before_loop(State, Req, HandlerState, Data);
 %% 7 bit payload length prefix exists
 websocket_data(State, Req, HandlerState,
-		<< Fin:1, Rsv:3, Opcode:4, Mask:1, PayloadLen:7, Rest/bits >>
+		<< Fin:1, Rsv:3/binary-unit:1, Opcode:4, Mask:1, PayloadLen:7, Rest/bits >>
 		= Data) when PayloadLen < 126 ->
 	websocket_data(State, Req, HandlerState,
 		Fin, Rsv, Opcode, Mask, PayloadLen, Rest, Data);
 %% 7+16 bits payload length prefix exists
 websocket_data(State, Req, HandlerState,
-		<< Fin:1, Rsv:3, Opcode:4, Mask:1, 126:7, PayloadLen:16, Rest/bits >>
+		<< Fin:1, Rsv:3/binary-unit:1, Opcode:4, Mask:1, 126:7, PayloadLen:16, Rest/bits >>
 		= Data) when PayloadLen > 125 ->
 	websocket_data(State, Req, HandlerState,
 		Fin, Rsv, Opcode, Mask, PayloadLen, Rest, Data);
 %% 7+16 bits payload length prefix missing
 websocket_data(State, Req, HandlerState,
-		<< _Fin:1, _Rsv:3, _Opcode:4, _Mask:1, 126:7, Rest/bits >>
+		<< _Fin:1, _Rsv:3/binary-unit:1, _Opcode:4, _Mask:1, 126:7, Rest/bits >>
 		= Data) when byte_size(Rest) < 2 ->
 	handler_before_loop(State, Req, HandlerState, Data);
 %% 7+64 bits payload length prefix exists
 websocket_data(State, Req, HandlerState,
-		<< Fin:1, Rsv:3, Opcode:4, Mask:1, 127:7, 0:1, PayloadLen:63,
+		<< Fin:1, Rsv:3/binary-unit:1, Opcode:4, Mask:1, 127:7, 0:1, PayloadLen:63,
 		   Rest/bits >> = Data) when PayloadLen > 16#FFFF ->
 	websocket_data(State, Req, HandlerState,
 		Fin, Rsv, Opcode, Mask, PayloadLen, Rest, Data);
 %% 7+64 bits payload length prefix missing
 websocket_data(State, Req, HandlerState,
-		<< _Fin:1, _Rsv:3, _Opcode:4, _Mask:1, 127:7, Rest/bits >>
+		<< _Fin:1, _Rsv:3/binary-unit:1, _Opcode:4, _Mask:1, 127:7, Rest/bits >>
 		= Data) when byte_size(Rest) < 8 ->
 	handler_before_loop(State, Req, HandlerState, Data);
 %% invalid payload length prefix.
@@ -303,44 +348,48 @@ websocket_data(State=#state{frag_state=undefined}, Req, HandlerState,
 websocket_data(State, Req, HandlerState, _Fin=0, _Rsv=0, Opcode, _Mask,
 		_PayloadLen, _Rest, _Buffer) when Opcode >= 8 ->
 	websocket_close(State, Req, HandlerState, {error, badframe});
+
+
+
+
 %% The opcode is only included in the first message fragment.
 websocket_data(State=#state{frag_state=undefined}, Req, HandlerState,
-		_Fin=0, _Rsv=0, Opcode, Mask, PayloadLen, Rest, Data) ->
+		_Fin=0, Rsv, Opcode, Mask, PayloadLen, Rest, Data) ->
 	websocket_before_unmask(
 		State#state{frag_state={nofin, Opcode}}, Req, HandlerState,
-		Data, Rest, 0, Mask, PayloadLen);
+		Data, Rest, 0, Mask, Rsv, PayloadLen);
 %% non-control opcode when expecting control message or next fragment.
 websocket_data(State=#state{frag_state={nofin, _, _}}, Req, HandlerState, _Fin,
-		_Rsv=0, Opcode, _Mask, _Ln, _Rest, _Data) when Opcode > 0, Opcode < 8 ->
+		_Rsv, Opcode, _Mask, _Ln, _Rest, _Data) when Opcode > 0, Opcode < 8 ->
 	websocket_close(State, Req, HandlerState, {error, badframe});
 %% If the first message fragment was incomplete, retry unmasking.
 websocket_data(State=#state{frag_state={nofin, Opcode}}, Req, HandlerState,
-		_Fin=0, _Rsv=0, Opcode, Mask, PayloadLen, Rest, Data) ->
+		_Fin=0, Rsv, Opcode, Mask, PayloadLen, Rest, Data) ->
 	websocket_before_unmask(
 		State#state{frag_state={nofin, Opcode}}, Req, HandlerState,
-		Data, Rest, 0, Mask, PayloadLen);
+		Data, Rest, 0, Mask, Rsv, PayloadLen);
 %% if the opcode is zero and the fin flag is zero, unmask and await next.
 websocket_data(State=#state{frag_state={nofin, _Opcode, _Payloads}}, Req,
-		HandlerState, _Fin=0, _Rsv=0, _Opcode2=0, Mask, PayloadLen, Rest,
+		HandlerState, _Fin=0, Rsv, _Opcode2=0, Mask, PayloadLen, Rest,
 		Data) ->
 	websocket_before_unmask(
-		State, Req, HandlerState, Data, Rest, 0, Mask, PayloadLen);
+		State, Req, HandlerState, Data, Rest, 0, Mask, Rsv, PayloadLen);
 %% when the last fragment is seen. Update the fragmentation status.
 websocket_data(State=#state{frag_state={nofin, Opcode, Payloads}}, Req,
-		HandlerState, _Fin=1, _Rsv=0, _Opcode=0, Mask, PayloadLen, Rest,
+		HandlerState, _Fin=1, Rsv, _Opcode=0, Mask, PayloadLen, Rest,
 		Data) ->
 	websocket_before_unmask(
 		State#state{frag_state={fin, Opcode, Payloads}},
-		Req, HandlerState, Data, Rest, 0, Mask, PayloadLen);
+		Req, HandlerState, Data, Rest, 0, Mask, Rsv, PayloadLen);
 %% control messages MUST NOT use 7+16 bits or 7+64 bits payload length prefixes
 websocket_data(State, Req, HandlerState, _Fin, _Rsv, Opcode, _Mask, PayloadLen,
 		_Rest, _Data) when Opcode >= 8, PayloadLen > 125 ->
 	 websocket_close(State, Req, HandlerState, {error, badframe});
 %% unfragmented message. unmask and dispatch the message.
-websocket_data(State=#state{version=Version}, Req, HandlerState, _Fin=1, _Rsv=0,
+websocket_data(State=#state{version=Version}, Req, HandlerState, _Fin=1, Rsv,
 		Opcode, Mask, PayloadLen, Rest, Data) when Version =/= 0 ->
 	websocket_before_unmask(
-			State, Req, HandlerState, Data, Rest, Opcode, Mask, PayloadLen);
+			State, Req, HandlerState, Data, Rest, Opcode, Mask, Rsv, PayloadLen);
 %% Something was wrong with the frame. Close the connection.
 websocket_data(State, Req, HandlerState, _Fin, _Rsv, _Opcode, _Mask,
 		_PayloadLen, _Rest, _Data) ->
@@ -348,99 +397,137 @@ websocket_data(State, Req, HandlerState, _Fin, _Rsv, _Opcode, _Mask,
 
 %% hybi routing depending on whether unmasking is needed.
 -spec websocket_before_unmask(#state{}, cowboy_req:req(), any(), binary(),
-	binary(), opcode(), 0 | 1, non_neg_integer() | undefined) -> closed.
+	binary(), opcode(), binary(), 0 | 1, non_neg_integer() | undefined) -> closed.
 websocket_before_unmask(State, Req, HandlerState, Data,
-		Rest, Opcode, Mask, PayloadLen) ->
-	case {Mask, PayloadLen} of
-		{0, 0} ->
-			websocket_dispatch(State, Req, HandlerState, Rest, Opcode, <<>>);
-		{1, N} when N + 4 > byte_size(Rest); N =:= undefined ->
+		Rest, Opcode, Mask, Rsv, PayloadLen) ->
+	case {Mask, PayloadLen, Rsv} of
+		{0, 0, << 0:3 >>} ->
+			websocket_dispatch(State, Req, HandlerState, Rest, Opcode, Rsv, <<>>);
+		{1, N, << 0:3 >>} when N + 4 > byte_size(Rest); N =:= undefined ->
 			%% @todo We probably should allow limiting frame length.
 			handler_before_loop(State, Req, HandlerState, Data);
-		{1, _N} ->
+		{1, _N, Rsv} ->
 			<< MaskKey:32, Payload:PayloadLen/binary, Rest2/bits >> = Rest,
 			websocket_unmask(State, Req, HandlerState, Rest2,
-				Opcode, Payload, MaskKey)
+				Opcode, Payload, MaskKey, Rsv)
 	end.
 
 %% hybi unmasking.
 -spec websocket_unmask(#state{}, cowboy_req:req(), any(), binary(),
-	opcode(), binary(), mask_key()) -> closed.
-websocket_unmask(State, Req, HandlerState, RemainingData,
-		Opcode, Payload, MaskKey) ->
-	websocket_unmask(State, Req, HandlerState, RemainingData,
-		Opcode, Payload, MaskKey, <<>>).
-
--spec websocket_unmask(#state{}, cowboy_req:req(), any(), binary(),
 	opcode(), binary(), mask_key(), binary()) -> closed.
 websocket_unmask(State, Req, HandlerState, RemainingData,
-		Opcode, << O:32, Rest/bits >>, MaskKey, Acc) ->
+		Opcode, Payload, MaskKey, Rsv) ->
+	websocket_unmask(State, Req, HandlerState, RemainingData,
+		Opcode, Payload, MaskKey, Rsv, <<>>).
+
+-spec websocket_unmask(#state{}, cowboy_req:req(), any(), binary(),
+	opcode(), binary(), mask_key(), binary(), binary()) -> closed.
+websocket_unmask(State, Req, HandlerState, RemainingData,
+		Opcode, << O:32, Rest/bits >>, MaskKey, Rsv, Acc) ->
 	T = O bxor MaskKey,
 	websocket_unmask(State, Req, HandlerState, RemainingData,
-		Opcode, Rest, MaskKey, << Acc/binary, T:32 >>);
+		Opcode, Rest, MaskKey, Rsv, << Acc/binary, T:32 >>);
 websocket_unmask(State, Req, HandlerState, RemainingData,
-		Opcode, << O:24 >>, MaskKey, Acc) ->
+		Opcode, << O:24 >>, MaskKey, Rsv, Acc) ->
 	<< MaskKey2:24, _:8 >> = << MaskKey:32 >>,
 	T = O bxor MaskKey2,
 	websocket_dispatch(State, Req, HandlerState, RemainingData,
-		Opcode, << Acc/binary, T:24 >>);
+		Opcode, Rsv, << Acc/binary, T:24 >>);
 websocket_unmask(State, Req, HandlerState, RemainingData,
-		Opcode, << O:16 >>, MaskKey, Acc) ->
+		Opcode, << O:16 >>, MaskKey, Rsv, Acc) ->
 	<< MaskKey2:16, _:16 >> = << MaskKey:32 >>,
 	T = O bxor MaskKey2,
 	websocket_dispatch(State, Req, HandlerState, RemainingData,
-		Opcode, << Acc/binary, T:16 >>);
+		Opcode, Rsv, << Acc/binary, T:16 >>);
 websocket_unmask(State, Req, HandlerState, RemainingData,
-		Opcode, << O:8 >>, MaskKey, Acc) ->
+		Opcode, << O:8 >>, MaskKey, Rsv, Acc) ->
 	<< MaskKey2:8, _:24 >> = << MaskKey:32 >>,
 	T = O bxor MaskKey2,
 	websocket_dispatch(State, Req, HandlerState, RemainingData,
-		Opcode, << Acc/binary, T:8 >>);
+		Opcode, Rsv, << Acc/binary, T:8 >>);
 websocket_unmask(State, Req, HandlerState, RemainingData,
-		Opcode, <<>>, _MaskKey, Acc) ->
+		Opcode, <<>>, _MaskKey, Rsv, Acc) ->
 	websocket_dispatch(State, Req, HandlerState, RemainingData,
-		Opcode, Acc).
+		Opcode, Rsv, Acc).
 
 %% hybi dispatching.
 -spec websocket_dispatch(#state{}, cowboy_req:req(), any(), binary(),
-	opcode(), binary()) -> closed.
+	opcode(), binary(), binary()) -> closed.
 %% First frame of a fragmented message unmasked. Expect intermediate or last.
+websocket_dispatch(State=#state{frag_state={nofin, Opcode}, 
+		extinfo=#extinfo{'x-webkit-deflate-frame'=X,z_inf=Zinf}},
+		Req, HandlerState, RemainingData, 0, << 1:1, 0:2 >>, Payload) 
+		when Opcode >= 8, X =/= undefined ->
+	websocket_data(State#state{frag_state={nofin, Opcode, inflate_payload_data(Payload, Zinf)}},
+	Req, HandlerState, RemainingData);
 websocket_dispatch(State=#state{frag_state={nofin, Opcode}}, Req, HandlerState,
-		RemainingData, 0, Payload) ->
+		RemainingData, 0, << 0:3 >>, Payload) ->
 	websocket_data(State#state{frag_state={nofin, Opcode, Payload}},
 		Req, HandlerState, RemainingData);
+
 %% Intermediate frame of a fragmented message unmasked. Add payload to buffer.
+websocket_dispatch(State=#state{frag_state={nofin, Opcode, Payloads},
+		extinfo=#extinfo{'x-webkit-deflate-frame'=X,z_inf=Zinf}}, 
+		Req, HandlerState, RemainingData, 0, << 1:1, 0:2 >>, Payload) 
+		when Opcode >= 8, X =/= undefined ->
+	InfPayload = inflate_payload_data(Payload, Zinf),
+	websocket_data(State#state{frag_state={nofin, Opcode,
+		<<Payloads/binary, InfPayload/binary>>}}, Req, HandlerState,
+		RemainingData);
 websocket_dispatch(State=#state{frag_state={nofin, Opcode, Payloads}}, Req,
-		HandlerState, RemainingData, 0, Payload) ->
+		HandlerState, RemainingData, 0, << 0:3 >>, Payload) ->
 	websocket_data(State#state{frag_state={nofin, Opcode,
 		<<Payloads/binary, Payload/binary>>}}, Req, HandlerState,
 		RemainingData);
+
+
 %% Last frame of a fragmented message unmasked. Dispatch to handler.
-websocket_dispatch(State=#state{frag_state={fin, Opcode, Payloads}}, Req,
-		HandlerState, RemainingData, 0, Payload) ->
+websocket_dispatch(State=#state{frag_state={fin, Opcode, Payloads},
+		extinfo=#extinfo{'x-webkit-deflate-frame'=X,z_inf=Zinf}}, 
+		Req, HandlerState, RemainingData, 0, << 1:1, RsvRest:2 >>, Payload) 
+		when Opcode >= 8, X =/= undefined ->
+	InfPayload = inflate_payload_data(Payload, Zinf),
+	%% Set Rsv1 back to 0 since we've inflated this by now:
 	websocket_dispatch(State#state{frag_state=undefined}, Req, HandlerState,
-		RemainingData, Opcode, <<Payloads/binary, Payload/binary>>);
+		RemainingData, Opcode, << 0:1, RsvRest/binary >>, <<Payloads/binary, InfPayload/binary>>);
+
+websocket_dispatch(State=#state{frag_state={fin, Opcode, Payloads}}, Req,
+		HandlerState, RemainingData, 0, Rsv = << 0:3 >>, Payload) ->
+	websocket_dispatch(State#state{frag_state=undefined}, Req, HandlerState,
+		RemainingData, Opcode, Rsv, <<Payloads/binary, Payload/binary>>);
+
+
 %% Text frame.
-websocket_dispatch(State, Req, HandlerState, RemainingData, 1, Payload) ->
+websocket_dispatch(State = #state{extinfo=#extinfo{
+		'x-webkit-deflate-frame'=X,z_inf=Zinf}}, Req, HandlerState, 
+		RemainingData, 1, << 1:1, 0:2 >>, Payload) when X =/= undefined ->
+	handler_call(State, Req, HandlerState, RemainingData,
+		websocket_handle, {text, inflate_payload_data(Payload, Zinf)}, fun websocket_data/4);
+websocket_dispatch(State, Req, HandlerState, RemainingData, 1, << 0:3 >>, Payload) ->
 	handler_call(State, Req, HandlerState, RemainingData,
 		websocket_handle, {text, Payload}, fun websocket_data/4);
 %% Binary frame.
-websocket_dispatch(State, Req, HandlerState, RemainingData, 2, Payload) ->
+websocket_dispatch(State = #state{extinfo=#extinfo{
+		'x-webkit-deflate-frame'=X,z_inf=Zinf}}, Req, HandlerState, 
+		RemainingData, 2, << 1:1, 0:2 >>, Payload) when X =/= undefined ->
+	handler_call(State, Req, HandlerState, RemainingData,
+		websocket_handle, {binary, inflate_payload_data(Payload, Zinf)}, fun websocket_data/4);
+websocket_dispatch(State, Req, HandlerState, RemainingData, 2, << 0:3 >>, Payload) ->
 	handler_call(State, Req, HandlerState, RemainingData,
 		websocket_handle, {binary, Payload}, fun websocket_data/4);
 %% Close control frame.
 %% @todo Handle the optional Payload.
-websocket_dispatch(State, Req, HandlerState, _RemainingData, 8, _Payload) ->
+websocket_dispatch(State, Req, HandlerState, _RemainingData, 8, _Rsv, _Payload) ->
 	websocket_close(State, Req, HandlerState, {normal, closed});
 %% Ping control frame. Send a pong back and forward the ping to the handler.
 websocket_dispatch(State=#state{socket=Socket, transport=Transport},
-		Req, HandlerState, RemainingData, 9, Payload) ->
+		Req, HandlerState, RemainingData, 9, _Rsv, Payload) ->
 	Len = hybi_payload_length(byte_size(Payload)),
 	Transport:send(Socket, << 1:1, 0:3, 10:4, 0:1, Len/bits, Payload/binary >>),
 	handler_call(State, Req, HandlerState, RemainingData,
 		websocket_handle, {ping, Payload}, fun websocket_data/4);
 %% Pong control frame.
-websocket_dispatch(State, Req, HandlerState, RemainingData, 10, Payload) ->
+websocket_dispatch(State, Req, HandlerState, RemainingData, 10, _Rsv, Payload) ->
 	handler_call(State, Req, HandlerState, RemainingData,
 		websocket_handle, {pong, Payload}, fun websocket_data/4).
 
@@ -483,16 +570,45 @@ websocket_send({text, Payload}, #state{
 %% Ignore all unknown frame types for compatibility with hixie 76.
 websocket_send(_Any, #state{version=0}) ->
 	ignore;
-websocket_send({Type, Payload}, #state{socket=Socket, transport=Transport}) ->
-	Opcode = case Type of
-		text -> 1;
-		binary -> 2;
-		ping -> 9;
-		pong -> 10
+websocket_send({Type, Payload0}, #state{socket=Socket, transport=Transport,
+										extinfo=#extinfo{
+											'x-webkit-deflate-frame'=true, 
+											z_def=Zdef}}) ->
+	Opcode = hybi_opcode_atom_to_integer(Type),
+	{Payload, Rsv} = case hybi_is_control_opcode(Opcode) of
+		true  -> 
+			{Payload0, << 0:3 >>}; %% Don't compress control frames
+		false ->
+			Deflated = deflate_payload_data(Payload0, Zdef),
+			%% Rsv bit 1 set when payload deflated
+			{Deflated, << 1:1, 0:2 >>}
 	end,
+	Len = hybi_payload_length(iolist_size(Payload)),
+	Transport:send(Socket, [<< 1:1, Rsv/bits, Opcode:4, 0:1, Len/bits >>, Payload]);
+websocket_send({Type, Payload}, #state{socket=Socket, transport=Transport}) ->
+	Opcode = hybi_opcode_atom_to_integer(Type),
 	Len = hybi_payload_length(iolist_size(Payload)),
 	Transport:send(Socket, [<< 1:1, 0:3, Opcode:4, 0:1, Len/bits >>,
 		Payload]).
+
+%% For (x-webkit-)deflate-frame extension:
+deflate_payload_data(Payload, Zdef) when is_list(Payload) ->
+	deflate_payload_data(iolist_to_binary(Payload), Zdef);
+deflate_payload_data(Payload, Zdef) when is_binary(Payload) ->
+	%% Flatten the deflate result so we can strip trailing 0x00,0x00,0xFF,0xFF
+	Deflated = iolist_to_binary(zlib:deflate(Zdef, Payload, full)),
+	LenMinus = erlang:size(Deflated) - 4,
+	case Deflated of
+		<<Main:LenMinus/binary-unit:8, 0:8, 0:8, 255:8, 255:8>> ->
+			Main;
+		_ -> 
+			Deflated
+	end.
+
+inflate_payload_data(Data0, Zinf) ->
+	Data = iolist_to_binary(Data0),
+	iolist_to_binary(zlib:inflate(Zinf, << Data/binary, 0:8, 0:8, 255:8, 255:8 >>)).
+
 
 -spec websocket_close(#state{}, cowboy_req:req(), any(), {atom(), atom()})
 	-> closed.
@@ -508,8 +624,9 @@ websocket_close(State=#state{socket=Socket, transport=Transport},
 
 -spec handler_terminate(#state{}, cowboy_req:req(),
 	any(), atom() | {atom(), atom()}) -> closed.
-handler_terminate(#state{handler=Handler, opts=Opts},
+handler_terminate(State=#state{handler=Handler, opts=Opts},
 		Req, HandlerState, TerminateReason) ->
+	handle_extensions_terminate(State),
 	try
 		Handler:websocket_terminate(TerminateReason, Req, HandlerState)
 	catch Class:Reason ->
@@ -523,6 +640,16 @@ handler_terminate(#state{handler=Handler, opts=Opts},
 			 HandlerState, PLReq, erlang:get_stacktrace()])
 	end,
 	closed.
+
+%% Clean up and resources used by extensions (compression contexts etc)
+-spec handle_extensions_terminate(#state{}) -> ok.
+handle_extensions_terminate(#state{extinfo=#extinfo{z_inf=Zinf, z_def=Zdef}}) 
+	when Zinf =/= undefined, Zdef =/= undefined ->
+	zlib:close(Zinf),
+	zlib:close(Zdef),
+	ok;
+handle_extensions_terminate(#state{}) -> 
+	ok.
 
 %% hixie-76 specific.
 
@@ -553,3 +680,22 @@ hybi_payload_length(N) ->
 		N when N =< 16#ffff -> << 126:7, N:16 >>;
 		N when N =< 16#7fffffffffffffff -> << 127:7, N:64 >>
 	end.
+
+hybi_opcode_atom_to_integer(text)   -> 1;
+hybi_opcode_atom_to_integer(binary) -> 2;
+hybi_opcode_atom_to_integer(ping)   -> 9;
+hybi_opcode_atom_to_integer(pong)   -> 10.
+
+%% Control opcodes have MSB set:
+hybi_is_control_opcode(X) when is_atom(X) -> 
+	hybi_is_control_opcode(hybi_opcode_atom_to_integer(X));
+hybi_is_control_opcode(X) when is_integer(X) -> 
+	X >= 8.
+
+hybi_extensions_response_headers(#state{extinfo=#extinfo{ headers = [] }}) -> 
+	[];
+hybi_extensions_response_headers(#state{extinfo=#extinfo{ headers = [H] }}) ->
+	%% TODO Hlist is a list of headers from each extension
+	%% they need to be joined, with ; between etc as per spec
+	%% this assumes just 1 header for now:
+	[ {<<"Sec-WebSocket-Extensions">>, H} ].
